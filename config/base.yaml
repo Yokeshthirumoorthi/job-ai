@@ -1,0 +1,22 @@
+# Scrape spec — edit these args, then run `just scrape`.
+# Every key here maps 1:1 to a field on ScrapeConfig in scraper.py.
+
+site_name: # any of: linkedin indeed glassdoor google
+  - indeed #         zip_recruiter bayt naukri bdjobs
+  - linkedin
+
+search_term: software engineer
+location: San Francisco, CA
+
+results_wanted: 2 # per board
+distance: 50 # miles
+hours_old: 72 # only postings newer than this many hours
+is_remote: false
+country_indeed: usa # Indeed/Glassdoor country
+linkedin_fetch_description: true
+verbose: 1 # 0 quiet | 1 errors+warnings | 2 all
+
+
+# Optional — uncomment to use:
+# job_type: fulltime          # fulltime | parttime | internship | contract
+# google_search_term: software engineer jobs near San Francisco since yesterday
