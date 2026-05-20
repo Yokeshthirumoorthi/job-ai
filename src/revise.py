@@ -1,33 +1,42 @@
-"""Multi-step JD revision: split a scraped JD into labeled, sanitized chunks.
+"""Multi-step JD revision: split scraped JDs into labeled, sanitized chunks.
 
-Pipeline per job (point-don't-type — the LLM never emits JD text):
+Pipeline per batch of jobs (point-don't-type — the LLM never emits JD text):
 
-  step 1  boundary detection  (LLM) -> {boundary_name, block_start, block_end,
-                                        is_needed}; we slice the ORIGINAL lines
+  step 1  boundary detection  (LLM) -> {job_id, boundary_name, block_start,
+                                        block_end, is_needed}
   step 2  sentence splitting  (regex, deterministic)
-  step 3  sentence labeling   (LLM) -> {index, label}; we attach to OUR text
+  step 3  sentence labeling   (LLM) -> {job_id, index, label}
   step 4  markdown sanitize   (regex, deterministic)
 
-Both LLM calls return only numbers/labels, so no JD text is ever reworded —
-chunks are a verbatim-derived, deterministically de-marked-down subset.
+Both LLM calls are BATCHED: every job in the jsonl is sent together, each
+tagged with a job id the model echoes back. A jsonl of <= _BATCH_SIZE jobs is
+exactly 2 LLM calls total; larger files split into safe batches of 2 calls each.
+
+The LLM only ever returns ids/numbers/labels, so no JD text is reworded —
+chunks are verbatim-derived, deterministically de-marked-down.
 
 Flow: data/jobs_<ts>.jsonl -> data/jobs_<ts>_revised.jsonl
 """
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from enum import Enum
 from pathlib import Path
 
 from openai import OpenAI
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from scraper import DATA_DIR, JobPost
 
 ROOT = Path(__file__).resolve().parent.parent
+
+_BATCH_SIZE = 25       # jobs per LLM call; a jsonl of <= this many = 2 calls total
+_MAX_TOKENS = 16000    # generous cap so a full batch's JSON reply is not truncated
+_MIN_CHUNK = 15        # drop sanitized chunks shorter than this many chars
 
 
 class LLMSettings(BaseSettings):
@@ -51,7 +60,7 @@ class ChunkLabel(str, Enum):
     context = "context"                # role/team/company background, or other
 
 
-# --- LLM response models (the LLM only ever fills in numbers / labels) --------
+# --- LLM response models (the LLM only ever fills in ids / numbers / labels) ---
 
 
 class Boundary(BaseModel):
@@ -63,9 +72,10 @@ class Boundary(BaseModel):
     is_needed: bool
 
 
-class BoundaryMap(BaseModel):
-    """Step-1 reply: the full list of sections."""
+class JobBoundaries(BaseModel):
+    """Step-1 reply for one job — its section list, keyed by echoed job_id."""
 
+    job_id: str
     boundaries: list[Boundary]
 
 
@@ -85,9 +95,10 @@ class LabeledIndex(BaseModel):
             return ChunkLabel.context
 
 
-class LabelMap(BaseModel):
-    """Step-3 reply: labels for every sentence index."""
+class JobLabels(BaseModel):
+    """Step-3 reply for one job — sentence labels, keyed by echoed job_id."""
 
+    job_id: str
     labels: list[LabeledIndex]
 
 
@@ -116,33 +127,50 @@ class RevisedJobPost(JobPost):
     description_chunks: list[JDChunk] = Field(default_factory=list)
 
 
-BOUNDARY_PROMPT = """You segment a job description into its sections.
+class JobState(BaseModel):
+    """Mutable per-job scratch carried through the batched pipeline."""
 
-You receive the JD as numbered lines (each prefixed with "<n>: "). Identify \
-every contiguous section. For each section return:
+    job_id: str
+    job: JobPost
+    blocks: list[str] = Field(default_factory=list)
+    boundaries: list[Boundary] = Field(default_factory=list)
+    sentences: list[Segment] = Field(default_factory=list)
+    labels: list[ChunkLabel] = Field(default_factory=list)
+
+
+BOUNDARY_PROMPT = """You segment job descriptions into their sections.
+
+You may receive SEVERAL jobs in one request. Each job starts with a line \
+"### JOB <job_id>" followed by that job's numbered lines (numbering restarts \
+at 0 for every job). Process every job and echo its job_id exactly.
+
+For each job, identify every contiguous section. For each section return:
 - boundary_name: a short name (e.g. "Role summary", "Responsibilities", \
 "Requirements", "Preferred qualifications", "Benefits", "About the company", \
 "Equal opportunity statement", "How to apply").
 - block_start, block_end: the first and last line number of the section, \
-inclusive.
+inclusive (using that job's own numbering).
 - is_needed: true if the section is core job-description content (role or team \
 summary, responsibilities, duties, requirements, qualifications, skills, \
 experience); false if it is noise (benefits and perks, company-wide marketing \
 or "about the company", diversity/EEO or legal boilerplate, application \
 instructions, compensation disclaimers).
 
-The sections must be contiguous and in order, together covering every line \
-exactly once with no gaps and no overlaps.
+Within each job the sections must be contiguous and in order, together \
+covering every line exactly once with no gaps and no overlaps.
 
 Return ONLY a JSON object:
-{"boundaries":[{"boundary_name":"Role summary","block_start":0,"block_end":3,\
-"is_needed":true}]}"""
+{"jobs":[{"job_id":"<id>","boundaries":[{"boundary_name":"Role summary",\
+"block_start":0,"block_end":3,"is_needed":true}]}]}"""
 
-LABEL_PROMPT = """You label sentences taken from the kept parts of a job \
-description.
+LABEL_PROMPT = """You label sentences taken from the kept parts of job \
+descriptions.
 
-You receive numbered sentences (each prefixed with "<n>: "). For each sentence \
-return its index and exactly one label:
+You may receive SEVERAL jobs in one request. Each job starts with a line \
+"### JOB <job_id>" followed by that job's numbered sentences (numbering \
+restarts at 0 for every job). Process every job and echo its job_id exactly.
+
+For each sentence return its index and exactly one label:
 - "responsibility": a duty or activity the person in the role will perform.
 - "requirement": a must-have qualification, skill, technology or experience.
 - "preferred": a nice-to-have or bonus qualification ("preferred", "a plus").
@@ -151,7 +179,7 @@ return its index and exactly one label:
 Do not rewrite, summarize or alter any sentence — only classify it by index.
 
 Return ONLY a JSON object:
-{"labels":[{"index":0,"label":"context"}]}"""
+{"jobs":[{"job_id":"<id>","labels":[{"index":0,"label":"context"}]}]}"""
 
 
 # --- Markdown handling (deterministic) ----------------------------------------
@@ -163,7 +191,6 @@ _EMPH = re.compile(r"\*\*|\*|__|`")                # bold / italic / code marks
 _ESCAPE = re.compile(r"\\([-\\`*_{}\[\]()#+.!&>~])")  # markdown backslash escapes
 _SPACE = re.compile(r"\s+")
 _SENTENCE = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")  # sentence boundary
-_MIN_CHUNK = 15                                    # drop fragments shorter than this
 
 
 def _is_heading(line: str) -> bool:
@@ -195,6 +222,7 @@ def _chat(client: OpenAI, model: str, system: str, user: str) -> str:
     response = client.chat.completions.create(
         model=model,
         temperature=0,
+        max_tokens=_MAX_TOKENS,
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -203,12 +231,14 @@ def _chat(client: OpenAI, model: str, system: str, user: str) -> str:
     return response.choices[0].message.content or ""
 
 
-def _extract_json(reply: str) -> str:
-    """Pull the outermost JSON object out of an LLM reply (tolerates fences)."""
+def _job_items(reply: str) -> list[object]:
+    """Pull the 'jobs' array out of a batched LLM reply (tolerates fences)."""
     start, end = reply.find("{"), reply.rfind("}")
     if start == -1 or end == -1:
         raise ValueError(f"no JSON object in LLM reply: {reply!r}")
-    return reply[start : end + 1]
+    parsed = json.loads(reply[start : end + 1])
+    items = parsed.get("jobs") if isinstance(parsed, dict) else None
+    return items if isinstance(items, list) else []
 
 
 def _numbered(items: list[str]) -> str:
@@ -216,30 +246,56 @@ def _numbered(items: list[str]) -> str:
     return "\n".join(f"{i}: {item}" for i, item in enumerate(items))
 
 
-# --- Pipeline steps -----------------------------------------------------------
+def _job_block(job_id: str, items: list[str]) -> str:
+    """Render one job's section of a batched prompt."""
+    return f"### JOB {job_id}\n{_numbered(items)}"
 
 
-def detect_boundaries(blocks: list[str], client: OpenAI, model: str) -> list[Boundary]:
-    """Step 1 — LLM marks section ranges; indices are clamped to valid blocks."""
-    try:
-        reply = _chat(client, model, BOUNDARY_PROMPT, _numbered(blocks))
-        parsed = BoundaryMap.model_validate_json(_extract_json(reply))
-    except Exception as error:  # noqa: BLE001 - never lose the JD on failure
-        print(f"  ! boundary step failed ({error}); keeping the whole JD")
-        return [Boundary(
-            boundary_name="all", block_start=0,
-            block_end=len(blocks) - 1, is_needed=True,
-        )]
-    last = len(blocks) - 1
-    clamped: list[Boundary] = []
-    for b in parsed.boundaries:
-        start = min(max(b.block_start, 0), last)
-        end = min(max(b.block_end, start), last)
-        clamped.append(Boundary(
-            boundary_name=b.boundary_name, block_start=start,
-            block_end=end, is_needed=b.is_needed,
-        ))
-    return clamped
+# --- Pipeline steps (batched) -------------------------------------------------
+
+
+def _blocks(description: str | None) -> list[str]:
+    """Split a raw JD into numbered blocks (its non-empty lines)."""
+    return [line for line in (description or "").split("\n") if line.strip()]
+
+
+def _whole_jd(block_count: int) -> list[Boundary]:
+    """Fallback section map — one needed section covering the entire JD."""
+    return [Boundary(
+        boundary_name="all", block_start=0,
+        block_end=max(block_count - 1, 0), is_needed=True,
+    )]
+
+
+def detect_boundaries(batch: list[JobState], client: OpenAI, model: str) -> None:
+    """Step 1 — one LLM call marks section ranges for every job in the batch."""
+    usable = [state for state in batch if state.blocks]
+    parsed: list[JobBoundaries] = []
+    if usable:
+        prompt = "\n\n".join(_job_block(s.job_id, s.blocks) for s in usable)
+        try:
+            for item in _job_items(_chat(client, model, BOUNDARY_PROMPT, prompt)):
+                try:
+                    parsed.append(JobBoundaries.model_validate(item))
+                except ValidationError:
+                    continue  # skip one malformed job, keep the rest of the batch
+        except (ValueError, json.JSONDecodeError) as error:
+            print(f"  ! boundary step failed ({error}); keeping whole JDs")
+    for state in batch:
+        match = next((j for j in parsed if j.job_id == state.job_id), None)
+        if match is None:
+            state.boundaries = _whole_jd(len(state.blocks))
+            continue
+        last = len(state.blocks) - 1
+        state.boundaries = [
+            Boundary(
+                boundary_name=b.boundary_name,
+                block_start=min(max(b.block_start, 0), last),
+                block_end=min(max(b.block_end, min(max(b.block_start, 0), last)), last),
+                is_needed=b.is_needed,
+            )
+            for b in match.boundaries
+        ]
 
 
 def needed_segments(blocks: list[str], boundaries: list[Boundary]) -> list[Segment]:
@@ -276,57 +332,71 @@ def to_sentences(segments: list[Segment]) -> list[Segment]:
     return sentences
 
 
-def label_sentences(
-    sentences: list[Segment], client: OpenAI, model: str
-) -> list[ChunkLabel]:
-    """Step 3 — LLM labels each sentence by index; unlabelled -> context."""
-    labels = [ChunkLabel.context] * len(sentences)
-    if not sentences:
-        return labels
-    try:
-        reply = _chat(
-            client, model, LABEL_PROMPT, _numbered([s.text for s in sentences])
+def label_sentences(batch: list[JobState], client: OpenAI, model: str) -> None:
+    """Step 3 — one LLM call labels every sentence of every job in the batch."""
+    usable = [state for state in batch if state.sentences]
+    parsed: list[JobLabels] = []
+    if usable:
+        prompt = "\n\n".join(
+            _job_block(s.job_id, [x.text for x in s.sentences]) for s in usable
         )
-        parsed = LabelMap.model_validate_json(_extract_json(reply))
-    except Exception as error:  # noqa: BLE001 - keep all sentences as context
-        print(f"  ! label step failed ({error}); labeling all as context")
-        return labels
-    for item in parsed.labels:
-        if 0 <= item.index < len(sentences):
-            labels[item.index] = item.label
-    return labels
+        try:
+            for item in _job_items(_chat(client, model, LABEL_PROMPT, prompt)):
+                try:
+                    parsed.append(JobLabels.model_validate(item))
+                except ValidationError:
+                    continue  # skip one malformed job, keep the rest of the batch
+        except (ValueError, json.JSONDecodeError) as error:
+            print(f"  ! label step failed ({error}); labeling all as context")
+    for state in batch:
+        labels = [ChunkLabel.context] * len(state.sentences)
+        match = next((j for j in parsed if j.job_id == state.job_id), None)
+        if match is not None:
+            for item in match.labels:
+                if 0 <= item.index < len(labels):
+                    labels[item.index] = item.label
+        state.labels = labels
 
 
-def revise_job(job: JobPost, client: OpenAI, model: str) -> RevisedJobPost:
-    """Run the four-step pipeline for a single job."""
-    blocks = [line for line in (job.description or "").split("\n") if line.strip()]
-    if not blocks:
-        return RevisedJobPost(**job.model_dump())
-    boundaries = detect_boundaries(blocks, client, model)          # step 1
-    sentences = to_sentences(needed_segments(blocks, boundaries))  # step 2
-    labels = label_sentences(sentences, client, model)             # step 3
+def _assemble(state: JobState) -> RevisedJobPost:
+    """Step 4 — sanitize each labeled sentence into the final chunk list."""
     chunks: list[JDChunk] = []
-    for sentence, label in zip(sentences, labels):
-        text = strip_markup(sentence.text)                         # step 4
+    for sentence, label in zip(state.sentences, state.labels):
+        text = strip_markup(sentence.text)
         if len(text) >= _MIN_CHUNK:
             chunks.append(JDChunk(text=text, label=label, section=sentence.section))
     return RevisedJobPost(
-        **job.model_dump(), boundaries=boundaries, description_chunks=chunks
+        **state.job.model_dump(),
+        boundaries=state.boundaries,
+        description_chunks=chunks,
     )
 
 
 def revise(jobs: list[JobPost], client: OpenAI, model: str) -> list[RevisedJobPost]:
-    """Run the pipeline over every job, printing a one-line summary each."""
+    """Run the batched pipeline — 2 LLM calls per batch of _BATCH_SIZE jobs."""
+    states = [
+        JobState(job_id=job.id or f"J{i}", job=job, blocks=_blocks(job.description))
+        for i, job in enumerate(jobs)
+    ]
+    batches = [states[i : i + _BATCH_SIZE] for i in range(0, len(states), _BATCH_SIZE)]
     revised: list[RevisedJobPost] = []
-    for index, job in enumerate(jobs, start=1):
-        result = revise_job(job, client, model)
-        kept = sum(1 for b in result.boundaries if b.is_needed)
-        print(
-            f"  [{index}/{len(jobs)}] {job.title or '(untitled)'}"
-            f" — {kept}/{len(result.boundaries)} sections kept,"
-            f" {len(result.description_chunks)} chunks"
-        )
-        revised.append(result)
+    for number, batch in enumerate(batches, start=1):
+        print(f"  batch {number}/{len(batches)} ({len(batch)} jobs) — 2 LLM calls")
+        detect_boundaries(batch, client, model)                       # LLM call 1
+        for state in batch:
+            state.sentences = to_sentences(
+                needed_segments(state.blocks, state.boundaries)
+            )
+        label_sentences(batch, client, model)                         # LLM call 2
+        for state in batch:
+            result = _assemble(state)
+            kept = sum(1 for b in result.boundaries if b.is_needed)
+            print(
+                f"    {state.job.title or '(untitled)'} —"
+                f" {kept}/{len(result.boundaries)} sections kept,"
+                f" {len(result.description_chunks)} chunks"
+            )
+            revised.append(result)
     return revised
 
 
