@@ -14,6 +14,10 @@ scrape:
 revise:
     uv run python src/revise.py
 
+# Export a stripped human-eval JSONL from the newest _revised.jsonl
+eval:
+    uv run python src/export_eval.py
+
 # Scrape then revise in one go
 all: scrape revise
 
