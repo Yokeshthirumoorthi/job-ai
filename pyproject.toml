@@ -13,6 +13,7 @@ dependencies = [
     "torch>=2.6",
     "sentence-transformers>=3.0",
     "numpy>=1.26",
+    "tqdm>=4.66",
 ]
 
 [tool.uv]

@@ -529,6 +529,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "sentence-transformers" },
     { name = "torch" },
+    { name = "tqdm" },
 ]
 
 [package.metadata]
@@ -542,6 +543,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "sentence-transformers", specifier = ">=3.0" },
     { name = "torch", specifier = ">=2.6", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "tqdm", specifier = ">=4.66" },
 ]
 
 [[package]]
