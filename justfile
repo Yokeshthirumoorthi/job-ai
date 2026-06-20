@@ -18,6 +18,14 @@ revise:
 eval:
     uv run python src/pipeline.py eval
 
+# Validate resume.yaml and chunk it -> data/resume_bullets.json
+chunk-resume:
+    uv run python src/resume.py chunk
+
+# Embed resume bullets on the GPU (cached) -> cache/resume_embeddings.npz
+embed:
+    uv run python src/resume.py embed
+
 # Scrape then revise in one go
 all: scrape revise
 

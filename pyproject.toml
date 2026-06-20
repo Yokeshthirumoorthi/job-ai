@@ -9,7 +9,22 @@ dependencies = [
     "pydantic-settings>=2.2",
     "pyyaml>=6.0",
     "openai>=1.40",
+    "pandas>=2.0",
+    "torch>=2.6",
+    "sentence-transformers>=3.0",
+    "numpy>=1.26",
 ]
 
 [tool.uv]
 package = false
+
+# torch must come from the PyTorch CUDA index — the default PyPI wheel is the
+# CPU build on Linux, which would silently fall back off the GPU. cu128 wheels
+# run fine on this machine's CUDA 13.0 driver (driver is backward compatible).
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
