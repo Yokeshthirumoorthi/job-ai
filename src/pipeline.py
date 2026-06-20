@@ -1,21 +1,17 @@
-"""Multi-step JD revision: split scraped JDs into labeled, sanitized chunks.
+"""End-to-end job pipeline: scrape -> revise -> eval, in one module.
 
-Pipeline per batch of jobs (point-don't-type — the LLM never emits JD text):
+Three stages, each usable as an importable function (from a notebook) or as a
+CLI step (`python src/pipeline.py <step>`):
 
-  step 1  boundary detection  (LLM) -> {job_id, boundary_name, block_start,
-                                        block_end, is_needed}
-  step 2  sentence splitting  (regex, deterministic)
-  step 3  sentence labeling   (LLM) -> {job_id, index, label}
-  step 4  markdown sanitize   (regex, deterministic)
+  scrape   config/base.yaml -> ScrapeConfig -> scrape_jobs() -> list[JobPost]
+           -> data/jobs_<ts>.jsonl
+  revise   data/jobs_<ts>.jsonl -> LLM-labeled chunks
+           -> data/jobs_<ts>_revised.jsonl
+  eval     data/jobs_<ts>_revised.jsonl -> slim, label-grouped review file
+           -> data/jobs_<ts>_eval.jsonl
 
-Both LLM calls are BATCHED: every job in the jsonl is sent together, each
-tagged with a job id the model echoes back. A jsonl of <= _BATCH_SIZE jobs is
-exactly 2 LLM calls total; larger files split into safe batches of 2 calls each.
-
-The LLM only ever returns ids/numbers/labels, so no JD text is reworded —
-chunks are verbatim-derived, deterministically de-marked-down.
-
-Flow: data/jobs_<ts>.jsonl -> data/jobs_<ts>_revised.jsonl
+The revise stage is point-don't-type: the LLM only ever returns ids / numbers /
+labels, so JD text is verbatim-derived and never reworded.
 """
 
 from __future__ import annotations
@@ -23,20 +19,140 @@ from __future__ import annotations
 import json
 import re
 import sys
+from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from openai import OpenAI
-from pydantic import BaseModel, Field, ValidationError, field_validator
+import yaml
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from scraper import DATA_DIR, JobPost
+if TYPE_CHECKING:
+    # Heavy SDKs (openai, pandas, jobspy) are imported lazily inside the
+    # functions that use them, so `import pipeline` stays fast. This block is
+    # only for type checkers — it never runs.
+    from openai import OpenAI
 
 ROOT = Path(__file__).resolve().parent.parent
+CONFIG_PATH = ROOT / "config" / "base.yaml"
+DATA_DIR = ROOT / "data"
 
 _BATCH_SIZE = 25       # jobs per LLM call; a jsonl of <= this many = 2 calls total
 _MAX_TOKENS = 16000    # generous cap so a full batch's JSON reply is not truncated
 _MIN_CHUNK = 15        # drop sanitized chunks shorter than this many chars
+
+
+# === Stage 1: scrape ==========================================================
+
+
+class Site(str, Enum):
+    """Job board JobSpy can scrape."""
+
+    linkedin = "linkedin"
+    indeed = "indeed"
+    glassdoor = "glassdoor"
+    google = "google"
+    zip_recruiter = "zip_recruiter"
+    bayt = "bayt"
+    naukri = "naukri"
+    bdjobs = "bdjobs"
+
+
+class JobType(str, Enum):
+    """Employment type filter."""
+
+    fulltime = "fulltime"
+    parttime = "parttime"
+    internship = "internship"
+    contract = "contract"
+
+
+class ScrapeConfig(BaseModel):
+    """Typed view of config/base.yaml — the inputs to a scrape run."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    site_name: list[Site]
+    search_term: str
+    location: str | None = None
+    google_search_term: str | None = None
+    results_wanted: int = Field(default=20, ge=1)
+    distance: int = Field(default=50, ge=0)
+    job_type: JobType | None = None
+    is_remote: bool = False
+    hours_old: int | None = Field(default=None, ge=1)
+    country_indeed: str = "usa"
+    linkedin_fetch_description: bool = False
+    verbose: int = Field(default=1, ge=0, le=2)
+
+    @classmethod
+    def load(cls, path: Path) -> "ScrapeConfig":
+        """Read and validate a YAML spec file."""
+        return cls.model_validate(yaml.safe_load(path.read_text()))
+
+
+class JobPost(BaseModel):
+    """One scraped job posting — one line in the output JSONL."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str | None = None
+    site: str | None = None
+    job_url: str | None = None
+    job_url_direct: str | None = None
+    title: str | None = None
+    company: str | None = None
+    location: str | None = None
+    date_posted: date | None = None
+    job_type: str | None = None
+    salary_source: str | None = None
+    interval: str | None = None
+    min_amount: float | None = None
+    max_amount: float | None = None
+    currency: str | None = None
+    is_remote: bool | None = None
+    job_level: str | None = None
+    job_function: str | None = None
+    company_industry: str | None = None
+    company_url: str | None = None
+    company_logo: str | None = None
+    emails: str | None = None
+    skills: str | None = None
+    description: str | None = None
+
+
+def scrape(config: ScrapeConfig) -> list[JobPost]:
+    """Run JobSpy and return validated JobPost models."""
+    import pandas as pd
+    from jobspy import scrape_jobs
+
+    # model_dump(mode="json") turns enums into the plain strings JobSpy wants;
+    # this is the only place a raw mapping touches the library boundary.
+    frame: pd.DataFrame = scrape_jobs(
+        **config.model_dump(mode="json", exclude_none=True)
+    )
+    rows = frame.astype(object).where(frame.notna(), None)
+    return [JobPost.model_validate(record) for record in rows.to_dict("records")]
+
+
+def save(jobs: list[JobPost], data_dir: Path) -> Path:
+    """Write jobs to data/jobs_<timestamp>.jsonl and return the path."""
+    data_dir.mkdir(exist_ok=True)
+    out = data_dir / f"jobs_{datetime.now():%Y%m%d_%H%M%S}.jsonl"
+    with out.open("w", encoding="utf-8") as handle:
+        for job in jobs:
+            handle.write(job.model_dump_json() + "\n")
+    return out
+
+
+# === Stage 2: revise ==========================================================
 
 
 class LLMSettings(BaseSettings):
@@ -49,6 +165,18 @@ class LLMSettings(BaseSettings):
     api_key: str
     model: str = "anthropic/claude-haiku-4.5"
     base_url: str = "https://openrouter.ai/api/v1"
+
+
+def make_client(settings: "LLMSettings") -> "OpenAI":
+    """Build an OpenAI-SDK client pointed at OpenRouter.
+
+    OpenRouter speaks the OpenAI API, so the `openai` package is used purely as
+    the HTTP client aimed at OpenRouter's base URL — no OpenAI service is
+    called. Imported lazily here to keep `import pipeline` fast.
+    """
+    from openai import OpenAI
+
+    return OpenAI(api_key=settings.api_key, base_url=settings.base_url)
 
 
 class ChunkLabel(str, Enum):
@@ -400,9 +528,6 @@ def revise(jobs: list[JobPost], client: OpenAI, model: str) -> list[RevisedJobPo
     return revised
 
 
-# --- IO -----------------------------------------------------------------------
-
-
 def latest_jsonl(data_dir: Path) -> Path:
     """Return the newest data/jobs_*.jsonl that is not itself a revised file."""
     candidates = sorted(
@@ -429,15 +554,108 @@ def save_revised(jobs: list[RevisedJobPost], source: Path) -> Path:
     return out
 
 
-def main() -> None:
+# === Stage 3: eval export =====================================================
+
+
+class EvalGroup(BaseModel):
+    """All JD sentences the revise step gave one label."""
+
+    label: ChunkLabel
+    text: list[str]
+
+
+class EvalJob(BaseModel):
+    """A job stripped down to what a human evaluator needs."""
+
+    job_id: str
+    position: str
+    company: str
+    url: str
+    labeled_jd: list[EvalGroup] = Field(default_factory=list)
+
+
+def latest_revised(data_dir: Path) -> Path:
+    """Return the newest data/jobs_*_revised.jsonl."""
+    candidates = sorted(
+        data_dir.glob("jobs_*_revised.jsonl"), key=lambda p: p.stat().st_mtime
+    )
+    if not candidates:
+        raise FileNotFoundError(f"no jobs_*_revised.jsonl found in {data_dir}")
+    return candidates[-1]
+
+
+def read_revised(path: Path) -> list[RevisedJobPost]:
+    """Read a revised jsonl back into typed RevisedJobPost models."""
+    with path.open(encoding="utf-8") as handle:
+        return [
+            RevisedJobPost.model_validate_json(line)
+            for line in handle
+            if line.strip()
+        ]
+
+
+def to_eval(job: RevisedJobPost) -> EvalJob:
+    """Project a revised job down to the human-eval fields, grouped by label."""
+    groups: list[EvalGroup] = []
+    for label in ChunkLabel:
+        text = [chunk.text for chunk in job.description_chunks if chunk.label == label]
+        if text:
+            groups.append(EvalGroup(label=label, text=text))
+    return EvalJob(
+        job_id=job.id or "",
+        position=job.title or "",
+        company=job.company or "",
+        url=job.job_url or job.job_url_direct or "",
+        labeled_jd=groups,
+    )
+
+
+def save_eval(jobs: list[EvalJob], source: Path) -> Path:
+    """Write the stripped jobs as jobs_<ts>_eval.jsonl next to the source."""
+    out = source.with_name(f"{source.stem.removesuffix('_revised')}_eval.jsonl")
+    with out.open("w", encoding="utf-8") as handle:
+        for job in jobs:
+            handle.write(job.model_dump_json() + "\n")
+    return out
+
+
+# === CLI ======================================================================
+
+
+def _run_scrape(_argv: list[str]) -> None:
+    config = ScrapeConfig.load(CONFIG_PATH)
+    jobs = scrape(config)
+    out = save(jobs, DATA_DIR)
+    print(f"Saved {len(jobs)} jobs -> {out.relative_to(ROOT)}")
+
+
+def _run_revise(argv: list[str]) -> None:
     settings = LLMSettings()  # type: ignore[call-arg]  # fields come from .env
-    source = Path(sys.argv[1]) if len(sys.argv) > 1 else latest_jsonl(DATA_DIR)
+    source = Path(argv[0]) if argv else latest_jsonl(DATA_DIR)
     print(f"Revising {source.relative_to(ROOT)} with {settings.model}")
-    client = OpenAI(api_key=settings.api_key, base_url=settings.base_url)
+    client = make_client(settings)
     jobs = read_jobs(source)
     revised = revise(jobs, client, settings.model)
     out = save_revised(revised, source)
     print(f"Saved {len(revised)} revised jobs -> {out.relative_to(ROOT)}")
+
+
+def _run_eval(argv: list[str]) -> None:
+    source = Path(argv[0]) if argv else latest_revised(DATA_DIR)
+    jobs = [to_eval(job) for job in read_revised(source)]
+    out = save_eval(jobs, source)
+    sentences = sum(len(group.text) for job in jobs for group in job.labeled_jd)
+    print(f"Exported {len(jobs)} jobs ({sentences} sentences) -> {out.relative_to(ROOT)}")
+
+
+_STEPS = {"scrape": _run_scrape, "revise": _run_revise, "eval": _run_eval}
+
+
+def main() -> None:
+    if len(sys.argv) < 2 or sys.argv[1] not in _STEPS:
+        print(f"usage: python src/pipeline.py {{{'|'.join(_STEPS)}}} [path]")
+        raise SystemExit(1)
+    _STEPS[sys.argv[1]](sys.argv[2:])
 
 
 if __name__ == "__main__":
