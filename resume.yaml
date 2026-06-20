@@ -1,0 +1,64 @@
+# Your resume — edit this file, then run `just chunk-resume`.
+# It is version-controlled and validated strictly: any unknown key (top-level
+# or nested) fails with a clear error pointing at the offending key.
+#
+# Required sections: summary, experience, skills.
+# Optional sections: projects, education, certifications.
+
+summary:
+  - Engineering leader with 9 years of experience, 4 of them managing software teams.
+  - Built and led platform and backend teams at high-growth startups.
+  - Track record of growing engineers and shipping reliable, scalable systems.
+
+experience:
+  - title: Engineering Manager
+    company: Acme Cloud
+    dates: 2021-present
+    highlights:
+      - Lead a team of 8 backend and platform engineers across two time zones.
+      - Own the reliability and scalability of a multi-tenant API serving 5M requests per day.
+      - Grew the team from 3 to 8 engineers and promoted two engineers to senior level.
+      - Partner with product and design on quarterly roadmap planning and prioritization.
+      - Introduced an on-call rotation and incident review process that cut MTTR by 40%.
+
+  - title: Senior Software Engineer
+    company: Bolt Systems
+    dates: 2017-2021
+    highlights:
+      - Designed and shipped a distributed job-processing service in Go and PostgreSQL.
+      - Mentored four junior engineers through code review and pairing.
+      - Migrated a monolith to containerized services running on Kubernetes.
+
+# Quote any skill line that contains a colon — an unquoted "Foo: bar" is read
+# by YAML as a key/value mapping and will fail validation.
+skills:
+  - People leadership, hiring, performance management, coaching.
+  - "Backend systems: Python, Go, PostgreSQL, Redis."
+  - "Infrastructure: Docker, Kubernetes, AWS, CI/CD pipelines."
+  - Cross-functional collaboration with product and design partners.
+  - Incident response, observability, and on-call process design.
+
+projects:
+  - name: Distributed job processor
+    dates: "2019"   # quote a bare year — unquoted it is read as a number
+    highlights:
+      - Built a Go + PostgreSQL service that processes async jobs at scale.
+      - Added at-least-once delivery with idempotency keys and dead-letter queues.
+      - Open-sourced the worker library; adopted by three internal teams.
+
+  - name: Internal developer portal
+    highlights:
+      - Designed a self-service portal for provisioning staging environments.
+      - Cut environment setup time from two days to under an hour.
+
+education:
+  - institution: State University
+    degree: B.S. Computer Science
+    dates: 2009-2013
+    highlights:
+      - Graduated with honors; focus on distributed systems.
+      - Teaching assistant for the undergraduate operating systems course.
+
+certifications:
+  - AWS Certified Solutions Architect - Professional
+  - Certified Kubernetes Administrator (CKA)
