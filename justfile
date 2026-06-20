@@ -8,15 +8,15 @@ install:
 
 # Scrape jobs using config/base.yaml -> data/jobs_<timestamp>.jsonl
 scrape:
-    uv run python src/scraper.py
+    uv run python src/pipeline.py scrape
 
 # LLM-clean the newest jsonl -> data/jobs_<timestamp>_revised.jsonl
 revise:
-    uv run python src/revise.py
+    uv run python src/pipeline.py revise
 
 # Export a stripped human-eval JSONL from the newest _revised.jsonl
 eval:
-    uv run python src/export_eval.py
+    uv run python src/pipeline.py eval
 
 # Scrape then revise in one go
 all: scrape revise
